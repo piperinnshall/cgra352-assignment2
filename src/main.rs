@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, Error};
+use anyhow::{Context, Error, Result};
 use opencv::core::{
     Mat, MatTraitConst, MatTraitConstManual, MatTraitManual, Point2i, Scalar, Vec3b, Vector,
 };
@@ -33,19 +33,21 @@ fn core(params: &Vector<i32>) -> Result<()> {
     Ok(image_write("Core.jpg", &im_nnf, &params)?)
 }
 
-fn initialize_nnf(_src: &Mat, target: &Mat) -> Result<Mat> {
+fn initialize_nnf(src: &Mat, target: &Mat) -> Result<Mat> {
     let mut nnf = Mat::new_rows_cols_with_default(
         target.rows(),
         target.cols(),
         opencv::core::CV_32SC2,
         Scalar::default(),
     )?;
-    // target.data_typed::<Point2i>()?
-    //     .iter()
-    //     .zip(nnf.data_typed_mut::<Point2i>()?.iter_mut())
-    //     .try_for_each(|(_t, _nnf)| {
-    //         Ok::<(), Error>(())
-    //     })?;
+    nnf.data_typed_mut::<Point2i>()?
+        .iter_mut()
+        .enumerate()
+        .try_for_each(|(idx, out)| {
+            let x = idx as i32 % target.cols();
+            let y = idx as i32 / target.cols();
+            Ok::<(), Error>(())
+        });
     Ok(nnf)
 }
 
