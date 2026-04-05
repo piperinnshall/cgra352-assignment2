@@ -51,7 +51,7 @@ fn randomize_nnf(
     nnf: &Mat,
     src_border: &Mat,
     target_border: &Mat,
-    d: Vec<f32>,
+    d: &mut Vec<f32>,
     patch: i32,
 ) -> Result<Mat> {
     let mut rng = rand::rng();
@@ -65,28 +65,40 @@ fn randomize_nnf(
         .iter_mut()
         .zip(nnf.data_typed::<Point2f>()?.iter())
         .enumerate()
-        .try_for_each(|(idx, (out, v))| {
-            let w = (nnf.rows() as f32).max(nnf.cols() as f32);
+        .try_for_each(|(idx, (out, p))| -> Result<()> {
+            let max_dimension = (nnf.rows() as f32).max(nnf.cols() as f32);
+            let mut best_offset = *p;
             for i in 0..5 {
-                let search_radius = w * (1f32 / 2f32).powi(i);
-                let r = Point2f::new(
+                let search_radius = max_dimension * (1f32 / 2f32).powi(i);
+                let rand = Point2f::new(
                     rng.random_range(-1f32..=1f32),
                     rng.random_range(-1f32..=1f32),
                 );
-                let u = *v + (r * search_radius);
+                let u = *p + (rand * search_radius);
                 let ux = u.x.clamp(0.0, src_border.cols() as f32) as i32;
                 let uy = u.y.clamp(0.0, src_border.rows() as f32) as i32;
                 let improved = improved_nnf(
                     Mat::roi(src_border, Rect::new(ux, uy, patch, patch))?,
                     Mat::roi(
                         target_border,
-                        Rect::new(idx as i32 % nnf.cols(), idx as i32 / nnf.cols(), patch, patch),
+                        Rect::new(
+                            idx as i32 % nnf.cols(),
+                            idx as i32 / nnf.cols(),
+                            patch,
+                            patch,
+                        ),
                     )?,
                     d[idx],
                 );
+                if let Some(ssd) = improved {
+                    d[idx] = ssd;
+                    best_offset = u;
+
+                }
             }
-            Ok(*out = Point2i::new(v.x.round() as i32, v.y.round() as i32));
-        });
+            *out = Point2i::new(best_offset.x.round() as i32, best_offset.y.round() as i32);
+            Ok(())
+        })?;
     Ok(dst)
 }
 
@@ -94,15 +106,9 @@ fn improved_nnf(
     proposed_roi: BoxedRef<'_, Mat>,
     patch_roi: BoxedRef<'_, Mat>,
     current_ssd: f32,
-) -> Result<f32> {
-    // let src_roi = Mat::roi(src_border, Rect::new(proposed_coordinate.x, proposed_coordinate.y, patch, patch))?;
-    // let target_roi = Mat::roi(target_border, Rect::new(patch_coordinate.x, patch_coordinate.y, patch, patch ))?;
-    let new_ssd = sum_squared_differences(proposed_roi, patch_roi)?;
-    Ok(if new_ssd < current_ssd {
-        new_ssd
-    } else {
-        current_ssd
-    })
+) -> Option<f32> {
+    let new_ssd = sum_squared_differences(proposed_roi, patch_roi).ok()?;
+    (new_ssd < current_ssd).then_some(new_ssd)
 }
 
 fn distance_over_cost(
@@ -114,12 +120,17 @@ fn distance_over_cost(
     nnf.data_typed::<Point2i>()?
         .iter()
         .enumerate()
-        .map(|(i, p)| {
+        .map(|(idx, p)| {
             sum_squared_differences(
                 Mat::roi(src_border, Rect::new(p.x, p.y, patch, patch))?,
                 Mat::roi(
                     target_border,
-                    Rect::new(i as i32 % nnf.cols(), i as i32 / nnf.cols(), patch, patch),
+                    Rect::new(
+                        idx as i32 % nnf.cols(),
+                        idx as i32 / nnf.cols(),
+                        patch,
+                        patch,
+                    ),
                 )?,
             )
         })
