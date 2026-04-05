@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use opencv::{
     boxed_ref::BoxedRef,
     core::{
-        Mat, MatTraitConst, MatTraitConstManual, MatTraitManual, Point2f, Point2i, Rect, Scalar,
+        Mat, MatTraitConst, MatTraitConstManual, MatTraitManual, Point2i, Rect, Scalar,
         Vec3b, Vector,
     },
 };
@@ -26,7 +26,9 @@ fn core(params: &Vector<i32>) -> Result<()> {
     let patch = 7;
     let src_border = image::border(&im_src, patch)?;
     let target_border = image::border(&im_target, patch)?;
-    let _d = distance_over_cost(&nnf, &src_border, &target_border, patch)?;
+    let mut d = distance_over_cost(&nnf, &src_border, &target_border, patch)?;
+    let nnf_random = randomize_nnf(&nnf, &src_border, &target_border, &mut d, patch)?;
+    image::write("Core2.jpg", &image::from_nnf(&nnf_random, &im_src)?, &params)?;
     Ok(())
 }
 
@@ -63,20 +65,17 @@ fn randomize_nnf(
     )?;
     dst.data_typed_mut::<Point2i>()?
         .iter_mut()
-        .zip(nnf.data_typed::<Point2f>()?.iter())
+        .zip(nnf.data_typed::<Point2i>()?.iter())
         .enumerate()
         .try_for_each(|(idx, (out, p))| -> Result<()> {
             let max_dimension = (nnf.rows() as f32).max(nnf.cols() as f32);
             let mut best_offset = *p;
             for i in 0..5 {
                 let search_radius = max_dimension * (1f32 / 2f32).powi(i);
-                let rand = Point2f::new(
-                    rng.random_range(-1f32..=1f32),
-                    rng.random_range(-1f32..=1f32),
-                );
-                let u = *p + (rand * search_radius);
-                let ux = u.x.clamp(0.0, src_border.cols() as f32) as i32;
-                let uy = u.y.clamp(0.0, src_border.rows() as f32) as i32;
+                let randx = rng.random_range(-1f32..=1f32);
+                let randy = rng.random_range(-1f32..=1f32);
+                let ux = (p.x as f32 + randx * search_radius).clamp(0.0, (src_border.cols() - patch) as f32) as i32;
+                let uy = (p.y as f32 + randy * search_radius).clamp(0.0, (src_border.rows() - patch) as f32) as i32;
                 let improved = improved_nnf(
                     Mat::roi(src_border, Rect::new(ux, uy, patch, patch))?,
                     Mat::roi(
@@ -92,11 +91,10 @@ fn randomize_nnf(
                 );
                 if let Some(ssd) = improved {
                     d[idx] = ssd;
-                    best_offset = u;
-
+                    best_offset = Point2i::new(ux, uy);
                 }
             }
-            *out = Point2i::new(best_offset.x.round() as i32, best_offset.y.round() as i32);
+            *out = best_offset;
             Ok(())
         })?;
     Ok(dst)
