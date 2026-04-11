@@ -27,12 +27,9 @@ fn core(params: &Vector<i32>) -> Result<()> {
     let src_border = image::border(&im_src, patch)?;
     let target_border = image::border(&im_target, patch)?;
     let mut d = distance_over_cost(&nnf, &src_border, &target_border, patch)?;
-    let nnf_random = randomize_nnf(&nnf, &src_border, &target_border, &mut d, patch)?;
-    image::write(
-        "Core2.jpg",
-        &image::from_nnf(&nnf_random, &im_src)?,
-        &params,
-    )?;
+    let nnf_rand =
+        randomize_nnf(&nnf, &src_border, &target_border, &mut d, patch).context("Randomize NNF")?;
+    image::write("Core2.jpg", &image::from_nnf(&nnf_rand, &im_src)?, &params)?;
     Ok(())
 }
 
@@ -78,12 +75,8 @@ fn randomize_nnf(
             let py = idx as i32 / nnf.cols();
             for i in 0..5 {
                 let search_radius = max_dimension * (1f32 / 2f32).powi(i);
-                let randx = rng.random_range(-1f32..=1f32);
-                let randy = rng.random_range(-1f32..=1f32);
-                let ux = (p.x as f32 + randx * search_radius)
-                    .clamp(0.0, (src_border.cols() - patch) as f32) as i32;
-                let uy = (p.y as f32 + randy * search_radius)
-                    .clamp(0.0, (src_border.rows() - patch) as f32) as i32;
+                let ux = propose_position(p.x, src_border.cols() - patch, search_radius, &mut rng);
+                let uy = propose_position(p.y, src_border.rows() - patch, search_radius, &mut rng);
                 let improved = improved_nnf(
                     Mat::roi(src_border, Rect::new(ux, uy, patch, patch))?,
                     Mat::roi(target_border, Rect::new(px, py, patch, patch))?,
@@ -94,10 +87,18 @@ fn randomize_nnf(
                     d[idx] = ssd;
                 }
             }
-            *out = best_offset;
-            Ok(())
+            Ok(*out = best_offset)
         })?;
     Ok(dst)
+}
+
+fn propose_position(
+    position: i32,
+    max: i32,
+    radius: f32,
+    rng: &mut impl rand::prelude::RngExt,
+) -> i32 {
+    (position as f32 + rng.random_range(-1f32..=1f32) * radius).clamp(0.0, max as f32) as i32
 }
 
 fn improved_nnf(

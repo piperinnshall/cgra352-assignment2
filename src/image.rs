@@ -40,8 +40,7 @@ pub fn from_nnf(nnf: &Mat, src: &Mat) -> Result<Mat> {
             let r = (p.x * 255 / src.cols()) as u8;
             let g = (p.y * 255 / src.rows()) as u8;
             let b = 255 - r.max(g);
-            *out = Vec3b::from([b, g, r]);
-            Ok(())
+            Ok(*out = Vec3b::from([b, g, r]))
         })?;
     Ok(dst)
 }
