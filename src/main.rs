@@ -20,16 +20,17 @@ fn core(params: &Vector<i32>) -> Result<()> {
     let im_src = image::read("Source.jpg")?;
     let im_target = image::read("Target.jpg")?;
 
-    let nnf = initialize_nnf(&im_src, &im_target).context("Initialize NNF")?;
+    let nnf = initialize_nnf(&im_src, &im_target).context("Initialize")?;
     image::write("Core1.jpg", &image::from_nnf(&nnf, &im_src)?, &params)?;
 
     let patch = 7;
     let src_border = image::border(&im_src, patch)?;
     let target_border = image::border(&im_target, patch)?;
     let mut d = distance_over_cost(&nnf, &src_border, &target_border, patch)?;
-    let nnf_rand =
-        randomize_nnf(&nnf, &src_border, &target_border, &mut d, patch).context("Randomize NNF")?;
-    image::write("Core2.jpg", &image::from_nnf(&nnf_rand, &im_src)?, &params)?;
+    let rand_nnf = rand_nnf(&nnf, &src_border, &target_border, &mut d, patch).context("Rand")?;
+    image::write("Core2.jpg", &image::from_nnf(&rand_nnf, &im_src)?, &params)?;
+
+    let _ = propagate_nnf(&nnf, &d);
     Ok(())
 }
 
@@ -50,7 +51,7 @@ fn initialize_nnf(src: &Mat, target: &Mat) -> Result<Mat> {
     Ok(dst)
 }
 
-fn randomize_nnf(
+fn rand_nnf(
     nnf: &Mat,
     src_border: &Mat,
     target_border: &Mat,
@@ -75,9 +76,9 @@ fn randomize_nnf(
             let py = idx as i32 / nnf.cols();
             for i in 0..5 {
                 let search_radius = max_dimension * (1f32 / 2f32).powi(i);
-                let ux = propose_position(p.x, src_border.cols() - patch, search_radius, &mut rng);
-                let uy = propose_position(p.y, src_border.rows() - patch, search_radius, &mut rng);
-                let improved = improved_nnf(
+                let ux = rand_propose(p.x, src_border.cols() - patch, search_radius, &mut rng);
+                let uy = rand_propose(p.y, src_border.rows() - patch, search_radius, &mut rng);
+                let improved = improved_rand_nnf(
                     Mat::roi(src_border, Rect::new(ux, uy, patch, patch))?,
                     Mat::roi(target_border, Rect::new(px, py, patch, patch))?,
                     d[idx],
@@ -87,21 +88,17 @@ fn randomize_nnf(
                     d[idx] = ssd;
                 }
             }
-            Ok(*out = best_offset)
+            *out = best_offset;
+            Ok(())
         })?;
     Ok(dst)
 }
 
-fn propose_position(
-    position: i32,
-    max: i32,
-    radius: f32,
-    rng: &mut impl rand::prelude::RngExt,
-) -> i32 {
+fn rand_propose(position: i32, max: i32, radius: f32, rng: &mut impl rand::prelude::RngExt) -> i32 {
     (position as f32 + rng.random_range(-1f32..=1f32) * radius).clamp(0.0, max as f32) as i32
 }
 
-fn improved_nnf(
+fn improved_rand_nnf(
     proposed_roi: BoxedRef<'_, Mat>,
     patch_roi: BoxedRef<'_, Mat>,
     current_ssd: f32,
@@ -120,17 +117,11 @@ fn distance_over_cost(
         .iter()
         .enumerate()
         .map(|(idx, p)| {
+            let x = idx as i32 % nnf.cols();
+            let y = idx as i32 / nnf.cols();
             sum_squared_differences(
                 Mat::roi(src_border, Rect::new(p.x, p.y, patch, patch))?,
-                Mat::roi(
-                    target_border,
-                    Rect::new(
-                        idx as i32 % nnf.cols(),
-                        idx as i32 / nnf.cols(),
-                        patch,
-                        patch,
-                    ),
-                )?,
+                Mat::roi(target_border, Rect::new(x, y, patch, patch))?,
             )
         })
         .collect()
@@ -150,4 +141,64 @@ fn sum_squared_differences(
                 + (a[1] as f32 - b[1] as f32).powi(2)
                 + (a[2] as f32 - b[2] as f32).powi(2)
         }))
+}
+
+// Propagation. We attempt to improve f (x, y) using the known
+// offsets of f (x − 1, y) and f (x, y − 1), assuming that the patch offsets
+// are likely to be the same. For example, if there is a good mapping
+// at (x − 1, y), we try to use the translation of that mapping one
+// pixel to the right for our mapping at (x, y). Let D(v) denote the
+// patch distance (error) between the patch at (x, y) in A and patch
+// (x, y) + v in B. We take the new value for f (x, y) to be the arg min
+// of {D( f (x, y)), D( f (x − 1, y)), D( f (x, y − 1))}.
+// The effect is that if (x, y) has a correct mapping and is in a coherent
+// region R, then all of R below and to the right of (x, y) will be
+// filled with the correct mapping. Moreover, on even iterations we
+// propagate information up and left by examining offsets in reverse
+// scan order, using f (x + 1, y) and f (x, y + 1) as our candidate offsets.
+
+// However, propagation with relative coordinates is easier because it just involves trying the
+// same offset vector as your adjacent patches, whereas for absolute coordinates it requires an
+// additional shift by +1 pixel (it is best to draw on paper if you are confused).
+
+fn propagate_nnf(nnf: &Mat, d: &[f32]) -> Result<Mat> {
+    let mut dst = Mat::new_rows_cols_with_default(
+        nnf.rows(),
+        nnf.cols(),
+        opencv::core::CV_32SC2,
+        Scalar::default(),
+    )?;
+    dst.data_typed_mut::<Point2i>()?
+        .iter_mut()
+        .zip(nnf.data_typed::<Point2i>()?.iter())
+        .enumerate()
+        .for_each(|(idx, (out, p))| {
+            let x = idx as i32 % nnf.cols();
+            let y = idx as i32 / nnf.cols();
+            // if idx == 462592-1 {
+            //     println!("{}, {}, {}, {}", x, y, nnf.cols(), y * nnf.cols() + x)
+            // }
+            *out = improved_propagate_nnf(idx, x, y, nnf.cols(), d);
+        });
+    Ok(dst)
+}
+
+fn improved_propagate_nnf(idx: usize, x: i32, y: i32, cols: i32, d: &[f32]) -> Point2i {
+    let left = (y - 1) * cols + x;
+    // let up = coordinates_to_idx(x, y - 1, cols);
+
+    if left as usize == 18446744073709550784 {
+        println!("{}, {}, {}, {}", x, y, cols, left as usize);
+    }
+
+    let (x, y) = match (d[idx]).min(d[idx]) { //.min(d[left]).min(d[up]) {
+        // n if n == d[left] => (x - 1, y),
+        // n if n == d[up] => (x, y - 1),
+        _ => (x, y),
+    };
+    Point2i::new(x, y)
+}
+
+fn coordinates_to_idx(x: i32, y: i32, cols: i32) -> usize {
+    (y * cols + x) as usize
 }
