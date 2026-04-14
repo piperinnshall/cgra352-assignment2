@@ -30,7 +30,8 @@ fn core(params: &Vector<i32>) -> Result<()> {
     let rand_nnf = rand_nnf(&nnf, &src_border, &target_border, &mut d, patch).context("Rand")?;
     image::write("Core2.jpg", &image::from_nnf(&rand_nnf, &im_src)?, &params)?;
 
-    let _ = propagate_nnf(&nnf, &d);
+    let propagate_nnf = propagate_nnf(&rand_nnf, &d).context("Propagate")?;
+    image::write("Core3.jpg", &image::from_nnf(&propagate_nnf, &im_src)?, &params)?;
     Ok(())
 }
 
@@ -143,62 +144,50 @@ fn sum_squared_differences(
         }))
 }
 
-// Propagation. We attempt to improve f (x, y) using the known
-// offsets of f (x − 1, y) and f (x, y − 1), assuming that the patch offsets
-// are likely to be the same. For example, if there is a good mapping
-// at (x − 1, y), we try to use the translation of that mapping one
-// pixel to the right for our mapping at (x, y). Let D(v) denote the
-// patch distance (error) between the patch at (x, y) in A and patch
-// (x, y) + v in B. We take the new value for f (x, y) to be the arg min
-// of {D( f (x, y)), D( f (x − 1, y)), D( f (x, y − 1))}.
-// The effect is that if (x, y) has a correct mapping and is in a coherent
-// region R, then all of R below and to the right of (x, y) will be
-// filled with the correct mapping. Moreover, on even iterations we
-// propagate information up and left by examining offsets in reverse
-// scan order, using f (x + 1, y) and f (x, y + 1) as our candidate offsets.
-
-// However, propagation with relative coordinates is easier because it just involves trying the
-// same offset vector as your adjacent patches, whereas for absolute coordinates it requires an
-// additional shift by +1 pixel (it is best to draw on paper if you are confused).
-
 fn propagate_nnf(nnf: &Mat, d: &[f32]) -> Result<Mat> {
+    let rows = nnf.rows();
+    let cols = nnf.cols();
     let mut dst = Mat::new_rows_cols_with_default(
-        nnf.rows(),
-        nnf.cols(),
+        rows,
+        cols,
         opencv::core::CV_32SC2,
         Scalar::default(),
     )?;
     dst.data_typed_mut::<Point2i>()?
         .iter_mut()
-        .zip(nnf.data_typed::<Point2i>()?.iter())
         .enumerate()
-        .for_each(|(idx, (out, p))| {
-            let x = idx as i32 % nnf.cols();
-            let y = idx as i32 / nnf.cols();
-            // if idx == 462592-1 {
-            //     println!("{}, {}, {}, {}", x, y, nnf.cols(), y * nnf.cols() + x)
-            // }
-            *out = improved_propagate_nnf(idx, x, y, nnf.cols(), d);
-        });
+        .try_for_each(|(idx, out)| -> Result<()> {
+            let x = idx as i32 % cols;
+            let y = idx as i32 / cols;
+            let improved = improved_propagate_nnf(idx, x, y, cols, d);
+            *out = *nnf.at_2d::<Point2i>(improved.y, improved.x)?;
+            Ok(())
+        })?;
     Ok(dst)
 }
 
 fn improved_propagate_nnf(idx: usize, x: i32, y: i32, cols: i32, d: &[f32]) -> Point2i {
-    let left = (y - 1) * cols + x;
-    // let up = coordinates_to_idx(x, y - 1, cols);
+    let left = coordinates_to_idx(x - 1, y, cols);
+    let up = coordinates_to_idx(x, y - 1, cols);
+    let min = (d[idx]).min(d[left]).min(d[up]);
 
-    if left as usize == 18446744073709550784 {
-        println!("{}, {}, {}, {}", x, y, cols, left as usize);
-    }
+    // let (x, y) = match (d[idx]).min(d[left]).min(d[up]) {
+    //     n if n == d[left] => (x - 1, y),
+    //     n if n == d[up] => (x, y - 1),
+    //     _ => (x, y),
+    // };
 
-    let (x, y) = match (d[idx]).min(d[idx]) { //.min(d[left]).min(d[up]) {
-        // n if n == d[left] => (x - 1, y),
-        // n if n == d[up] => (x, y - 1),
-        _ => (x, y),
+    let (x, y) = if min == d[left] {
+        (x - 1, y)
+    } else if min == d[up] {
+        (x, y - 1)
+    } else {
+        (x, y)
     };
+
     Point2i::new(x, y)
 }
 
 fn coordinates_to_idx(x: i32, y: i32, cols: i32) -> usize {
-    (y * cols + x) as usize
+    (y.abs() * cols + x.abs()) as usize
 }
