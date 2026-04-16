@@ -84,42 +84,26 @@ fn rand_nnf(
 ) -> Result<Mat> {
     let max_dimension = (nnf.rows() as f32).max(nnf.cols() as f32);
     let mut rng = rand::rng();
-    let mut dst = Mat::new_rows_cols_with_default(
-        nnf.rows(),
-        nnf.cols(),
-        opencv::core::CV_32SC2,
-        Scalar::default(),
-    )?;
-    dst.data_typed_mut::<Point2i>()?
-        .iter_mut()
-        .zip(nnf.data_typed::<Point2i>()?.iter())
-        .enumerate()
-        .try_for_each(|(idx, (out, p))| -> Result<()> {
-            let px = idx as i32 % nnf.cols();
-            let py = idx as i32 / nnf.cols();
-            let mut best_offset = *p;
-            for i in 0..5 {
-                let search_radius = max_dimension * (1f32 / 2f32).powi(i);
-                let ux = rand_propose(p.x, src_border.cols() - patch, search_radius, &mut rng);
-                let uy = rand_propose(p.y, src_border.rows() - patch, search_radius, &mut rng);
-                let improved = improved_nnf(
-                    &[(
-                        Mat::roi(src_border, Rect::new(ux, uy, patch, patch))?,
-                        Mat::roi(target_border, Rect::new(px, py, patch, patch))?,
-                        ux,
-                        uy,
-                    )],
-                    d[idx],
-                );
-                if let Some((ssd, x, y)) = improved {
-                    best_offset = Point2i::new(x, y);
-                    d[idx] = ssd;
-                }
-            }
-            *out = best_offset;
-            Ok(())
-        })?;
-    Ok(dst)
+    for_each_cell(nnf, |idx, px, py, p, _| -> Result<Point2i> {
+        let mut best_offset = *p;
+        let mut candidates = Vec::with_capacity(5);
+        for i in 0..5 {
+            let search_radius = max_dimension * (0.5f32).powi(i);
+            let ux = rand_propose(p.x, src_border.cols() - patch, search_radius, &mut rng);
+            let uy = rand_propose(p.y, src_border.rows() - patch, search_radius, &mut rng);
+            candidates.push((
+                Mat::roi(src_border, Rect::new(ux, uy, patch, patch))?,
+                Mat::roi(target_border, Rect::new(px, py, patch, patch))?,
+                ux,
+                uy,
+            ));
+        }
+        if let Some((ssd, x, y)) = improved_nnf(&candidates, d[idx]) {
+            best_offset = Point2i::new(x, y);
+            d[idx] = ssd;
+        }
+        Ok(best_offset)
+    })
 }
 
 fn rand_propose(position: i32, max: i32, radius: f32, rng: &mut impl rand::prelude::RngExt) -> i32 {
@@ -133,43 +117,30 @@ fn propagate_nnf(
     d: &mut Vec<f32>,
     patch: i32,
 ) -> Result<Mat> {
-    let mut dst = Mat::new_rows_cols_with_default(
-        nnf.rows(),
-        nnf.cols(),
-        opencv::core::CV_32SC2,
-        Scalar::default(),
-    )?;
-    for py in 1..nnf.rows() - 1 {
-        for px in 1..nnf.cols() - 1 {
-            let idx = py * nnf.cols() + px;
-            let mut best_offset = *nnf.at_2d::<Point2i>(py, px)?;
-            let left = *dst.at_2d::<Point2i>(py, px - 1)?;
-            let up = *dst.at_2d::<Point2i>(py - 1, px)?;
-            let improved = improved_nnf(
-                &[
-                    (
-                        Mat::roi(src_border, Rect::new(left.x, left.y, patch, patch))?,
-                        Mat::roi(target_border, Rect::new(px, py, patch, patch))?,
-                        left.x,
-                        left.y,
-                    ),
-                    (
-                        Mat::roi(src_border, Rect::new(up.x, up.y, patch, patch))?,
-                        Mat::roi(target_border, Rect::new(px, py, patch, patch))?,
-                        up.x,
-                        up.y,
-                    ),
-                ],
-                d[idx as usize],
-            );
-            if let Some((ssd, x, y)) = improved {
-                best_offset = Point2i::new(x, y);
-                d[idx as usize] = ssd;
+    for_each_cell(nnf, |idx, px, py, p, dst| -> Result<Point2i> {
+        let mut best_offset = *p;
+        let mut candidates = Vec::new();
+        let mut add = |dx: i32, dy: i32| -> Result<()> {
+            let n = *dst.at_2d::<Point2i>(py + dy, px + dx)?;
+            candidates.push((
+                Mat::roi(src_border, Rect::new(n.x, n.y, patch, patch))?,
+                Mat::roi(target_border, Rect::new(px, py, patch, patch))?,
+                n.x,
+                n.y,
+            ));
+            Ok(())
+        };
+        for (dx, dy) in [(-1, 0), (0, -1)] {
+            if (dx == -1 && px > 0) || (dy == -1 && py > 0) {
+                add(dx, dy)?;
             }
-            *dst.at_2d_mut::<Point2i>(py, px)? = best_offset;
         }
-    }
-    Ok(dst)
+        if let Some((ssd, x, y)) = improved_nnf(&candidates, d[idx]) {
+            best_offset = Point2i::new(x, y);
+            d[idx] = ssd;
+        }
+        Ok(best_offset)
+    })
 }
 
 fn improved_nnf(
@@ -188,6 +159,30 @@ fn improved_nnf(
         Some((ssd, x, y)) if ssd < current_ssd => Some((ssd, x, y)),
         _ => None,
     }
+}
+
+fn for_each_cell(
+    nnf: &Mat,
+    mut f: impl FnMut(usize, i32, i32, &Point2i, &Mat) -> Result<Point2i>,
+) -> Result<Mat> {
+    let mut dst = Mat::new_rows_cols_with_default(
+        nnf.rows(),
+        nnf.cols(),
+        opencv::core::CV_32SC2,
+        Scalar::default(),
+    )?;
+    let cols = nnf.cols();
+    nnf.data_typed::<Point2i>()?
+        .iter()
+        .enumerate()
+        .try_for_each(|(idx, p)| -> Result<()> {
+            let px = idx as i32 % cols;
+            let py = idx as i32 / cols;
+            let best = f(idx, px, py, p, &dst)?;
+            *dst.at_2d_mut::<Point2i>(py, px)? = best;
+            Ok(())
+        })?;
+    Ok(dst)
 }
 
 fn sum_squared_differences(src_roi: &Mat, target_roi: &Mat) -> Result<f32> {
