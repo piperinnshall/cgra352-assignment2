@@ -75,72 +75,89 @@ fn initialize_nnf(src: &Mat, target: &Mat) -> Result<Mat> {
     Ok(dst)
 }
 
-fn rand_nnf(
-    nnf: &Mat,
-    src_border: &Mat,
-    target_border: &Mat,
-    d: &mut Vec<f32>,
-    patch: i32,
-) -> Result<Mat> {
-    let max_dimension = (nnf.rows() as f32).max(nnf.cols() as f32);
+fn rand_nnf(nnf: &Mat, src: &Mat, target: &Mat, d: &mut Vec<f32>, patch: i32) -> Result<Mat> {
+    let max_dim = (nnf.rows() as f32).max(nnf.cols() as f32);
     let mut rng = rand::rng();
     for_each_cell(nnf, |idx, px, py, p, _| -> Result<Point2i> {
-        let mut best_offset = *p;
-        let mut candidates = Vec::with_capacity(5);
-        for i in 0..5 {
-            let search_radius = max_dimension * (0.5f32).powi(i);
-            let ux = rand_propose(p.x, src_border.cols() - patch, search_radius, &mut rng);
-            let uy = rand_propose(p.y, src_border.rows() - patch, search_radius, &mut rng);
-            candidates.push((
-                Mat::roi(src_border, Rect::new(ux, uy, patch, patch))?,
-                Mat::roi(target_border, Rect::new(px, py, patch, patch))?,
-                ux,
-                uy,
-            ));
-        }
-        if let Some((ssd, x, y)) = improved_nnf(&candidates, d[idx]) {
-            best_offset = Point2i::new(x, y);
-            d[idx] = ssd;
-        }
-        Ok(best_offset)
+        rand_one_patch(src, target, d, patch, max_dim, &mut rng, idx, px, py, p)
     })
+}
+
+fn propagate_nnf(nnf: &Mat, src: &Mat, target: &Mat, d: &mut Vec<f32>, patch: i32) -> Result<Mat> {
+    for_each_cell(nnf, |idx, px, py, p, dst| -> Result<Point2i> {
+        propagate_one_patch(src, target, d, patch, idx, px, py, p, dst)
+    })
+}
+
+fn rand_one_patch(
+    src: &Mat,
+    target: &Mat,
+    d: &mut Vec<f32>,
+    patch: i32,
+    max_dim: f32,
+    rng: &mut impl rand::prelude::RngExt,
+    idx: usize,
+    px: i32,
+    py: i32,
+    p: &Point2i,
+) -> Result<Point2i> {
+    let mut best_offset = *p;
+    let mut candidates = Vec::with_capacity(5);
+    for i in 0..5 {
+        let search_radius = max_dim * (0.5f32).powi(i);
+        let ux = rand_propose(p.x, src.cols() - patch, search_radius, rng);
+        let uy = rand_propose(p.y, src.rows() - patch, search_radius, rng);
+        candidates.push((
+            Mat::roi(src, Rect::new(ux, uy, patch, patch))?,
+            Mat::roi(target, Rect::new(px, py, patch, patch))?,
+            ux,
+            uy,
+        ));
+    }
+    if let Some((ssd, x, y)) = improved_nnf(&candidates, d[idx]) {
+        best_offset = Point2i::new(x, y);
+        d[idx] = ssd;
+    }
+    Ok(best_offset)
 }
 
 fn rand_propose(position: i32, max: i32, radius: f32, rng: &mut impl rand::prelude::RngExt) -> i32 {
     (position as f32 + rng.random_range(-1f32..=1f32) * radius).clamp(0.0, max as f32) as i32
 }
 
-fn propagate_nnf(
-    nnf: &Mat,
-    src_border: &Mat,
-    target_border: &Mat,
+fn propagate_one_patch(
+    src: &Mat,
+    target: &Mat,
     d: &mut Vec<f32>,
     patch: i32,
-) -> Result<Mat> {
-    for_each_cell(nnf, |idx, px, py, p, dst| -> Result<Point2i> {
-        let mut best_offset = *p;
-        let mut candidates = Vec::new();
-        let mut add = |dx: i32, dy: i32| -> Result<()> {
-            let n = *dst.at_2d::<Point2i>(py + dy, px + dx)?;
-            candidates.push((
-                Mat::roi(src_border, Rect::new(n.x, n.y, patch, patch))?,
-                Mat::roi(target_border, Rect::new(px, py, patch, patch))?,
-                n.x,
-                n.y,
-            ));
-            Ok(())
-        };
-        for (dx, dy) in [(-1, 0), (0, -1)] {
-            if (dx == -1 && px > 0) || (dy == -1 && py > 0) {
-                add(dx, dy)?;
-            }
+    idx: usize,
+    px: i32,
+    py: i32,
+    p: &Point2i,
+    dst: &Mat
+) -> Result<Point2i> {
+    let mut best_offset = *p;
+    let mut candidates = Vec::new();
+    let mut add = |dx: i32, dy: i32| -> Result<()> {
+        let n = *dst.at_2d::<Point2i>(py + dy, px + dx)?;
+        candidates.push((
+            Mat::roi(src, Rect::new(n.x, n.y, patch, patch))?,
+            Mat::roi(target, Rect::new(px, py, patch, patch))?,
+            n.x,
+            n.y,
+        ));
+        Ok(())
+    };
+    for (dx, dy) in [(-1, 0), (0, -1)] {
+        if (dx == -1 && px > 0) || (dy == -1 && py > 0) {
+            add(dx, dy)?;
         }
-        if let Some((ssd, x, y)) = improved_nnf(&candidates, d[idx]) {
-            best_offset = Point2i::new(x, y);
-            d[idx] = ssd;
-        }
-        Ok(best_offset)
-    })
+    }
+    if let Some((ssd, x, y)) = improved_nnf(&candidates, d[idx]) {
+        best_offset = Point2i::new(x, y);
+        d[idx] = ssd;
+    }
+    Ok(best_offset)
 }
 
 fn improved_nnf(
